@@ -26,14 +26,14 @@ class PipelineConfig:
         default_factory=lambda: _get_path_env(
             "RAW_ROOT",
             r"/EnergyBench/Dataset_V0.0/Energy-Load-Profiles",
-        )
+        ) / "Dataset_V0.0" / "Energy-Load-Profiles"
     )
     resolution: str = "Hourly"                    # "15min" | "30min" | "Hourly"
     out_root: Path = field(
         default_factory=lambda: _get_path_env(
             "OUT_ROOT",
             r"/EnergyBench-Anomaly",
-        )
+        ) / "EnergyBench-Anomaly"
     )
 
     # ---------- Passo 1: split ----------
