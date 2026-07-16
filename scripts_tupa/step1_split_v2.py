@@ -211,6 +211,53 @@ def _read_cols(fp: Path, cols: list[str]) -> pd.DataFrame:
     return df[[c for c in cols if c in df.columns]].reset_index(drop=True)
 
 
+def _iter_wide_columns(fp: Path, tcol, cols: list[str]):
+    """Itera as colunas de um arquivo WIDE lendo em LOTES limitados por
+    CFG.read_ram_budget_gb — em vez de 1 leitura por coluna (que reabre o
+    arquivo e reparseia um rodapé de metadados gigante a cada coluna;
+    catastrófico com dezenas de milhares de colunas).
+
+    Se o arquivo inteiro couber no orçamento, é UMA única leitura — o
+    pyarrow descompacta as colunas em paralelo (quanto mais núcleos,
+    mais rápido)."""
+    # nº de linhas via metadados (barato) -> estimativa de bytes por coluna
+    try:
+        import pyarrow.parquet as pq
+        n_rows = pq.ParquetFile(fp).metadata.num_rows
+    except Exception:
+        n_rows = None
+    if n_rows:
+        bytes_per_col = n_rows * 8
+        budget = int(CFG.read_ram_budget_gb * 1e9)
+        # LINHA CRUCIAL: tamanho do lote = quantas colunas cabem no
+        # orçamento; se todas cabem, o loop abaixo faz UMA leitura só.
+        batch_size = max(1, min(len(cols), budget // max(bytes_per_col, 1)))
+    else:
+        batch_size = len(cols)                    # sem metadados: tenta inteiro
+
+    ts = None
+    batches = [cols[i:i + batch_size] for i in range(0, len(cols), batch_size)]
+    bar = tqdm(batches, desc=f"  lotes de {fp.name} "
+                             f"({len(cols)} colunas, lote={batch_size})",
+               unit="lote", file=sys.stdout, dynamic_ncols=True, leave=False)
+    for batch in bar:
+        use = ([tcol] if tcol else []) + batch
+        dfb = _read_cols(fp, use)                 # tolerante a coluna-índice
+        if ts is None and tcol and tcol in dfb.columns:
+            ts = pd.to_datetime(dfb[tcol], errors="coerce")
+        for c in batch:
+            if c not in dfb.columns:
+                continue
+            col = pd.to_numeric(dfb[c], errors="coerce")
+            if col.notna().sum() == 0:
+                continue
+            out = pd.DataFrame({"energy": col})
+            if ts is not None:
+                out["timestamp"] = ts.values
+            yield _safe_name(c), out
+        del dfb                                   # libera o lote antes do próximo
+
+
 def iter_building_series_file(fp: Path):
     """Como iter_building_series, mas decidindo o layout pelo SCHEMA quando
     possível (parquet), para nunca materializar um wide gigante inteiro."""
@@ -228,22 +275,7 @@ def iter_building_series_file(fp: Path):
             idcol = _find_col(non_time, ID_CANDIDATES)
             vcol = _find_col(non_time, VALUE_CANDIDATES)
             if idcol is None and vcol is None:
-                # WIDE: uma coluna por prédio — lê [tempo, coluna] por vez.
-                ts = (pd.to_datetime(_read_col(fp, tcol), errors="coerce")
-                      if tcol else None)
-                # Barra por COLUNA: em arquivos wide gigantes (SynD/SDG),
-                # cada coluna é um prédio lido separadamente — sem isso,
-                # o arquivo inteiro parece "travado".
-                for c in tqdm(non_time, desc=f"  colunas de {fp.name}",
-                              unit="prédio", file=sys.stdout,
-                              dynamic_ncols=True, leave=False):
-                    col = pd.to_numeric(_read_col(fp, c), errors="coerce")
-                    if col.notna().sum() == 0:
-                        continue
-                    out = pd.DataFrame({"energy": col})
-                    if ts is not None:
-                        out["timestamp"] = ts.values
-                    yield _safe_name(c), out
+                yield from _iter_wide_columns(fp, tcol, non_time)
                 return
             if idcol is None and vcol is not None:
                 # SINGLE: lê só as colunas necessárias.
