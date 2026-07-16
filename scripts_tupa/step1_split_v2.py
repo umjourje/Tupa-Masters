@@ -26,11 +26,20 @@ import hashlib
 import json
 import re
 import shutil
+import time
+import time
 from collections import defaultdict
 from pathlib import Path
+import sys
 import numpy as np
 import pandas as pd
 from config import CFG
+
+try:
+    from tqdm import tqdm
+except ImportError:                              # fallback sem dependência
+    def tqdm(it, **kw):
+        return it
 
 # Candidatos (case-insensitive) para detecção de esquema:
 TIME_CANDIDATES = ("timestamp", "datetime", "date_time", "date", "time",
@@ -165,6 +174,18 @@ def _clear_partial_outputs(group_rel: Path) -> None:
 # arquivo inteiro em RAM (causa provável do OOM/'Killed' após state=WY,
 # quando a ordem alfabética chega a SDG/SynD).
 # ---------------------------------------------------------------------------
+def _fmt_dur(seconds: float) -> str:
+    """Formata duração como 1h02m03s / 4m05s / 6.7s."""
+    if seconds >= 3600:
+        h, r = divmod(int(seconds), 3600)
+        m, s = divmod(r, 60)
+        return f"{h}h{m:02d}m{s:02d}s"
+    if seconds >= 60:
+        m, s = divmod(int(seconds), 60)
+        return f"{m}m{s:02d}s"
+    return f"{seconds:.1f}s"
+
+
 def _read_col(fp: Path, col: str) -> pd.Series:
     """Lê UMA coluna do parquet, tolerante ao caso em que ela foi gravada
     como ÍNDICE do DataFrame original: o schema do pyarrow a lista como
@@ -210,7 +231,12 @@ def iter_building_series_file(fp: Path):
                 # WIDE: uma coluna por prédio — lê [tempo, coluna] por vez.
                 ts = (pd.to_datetime(_read_col(fp, tcol), errors="coerce")
                       if tcol else None)
-                for c in non_time:
+                # Barra por COLUNA: em arquivos wide gigantes (SynD/SDG),
+                # cada coluna é um prédio lido separadamente — sem isso,
+                # o arquivo inteiro parece "travado".
+                for c in tqdm(non_time, desc=f"  colunas de {fp.name}",
+                              unit="prédio", file=sys.stdout,
+                              dynamic_ncols=True, leave=False):
                     col = pd.to_numeric(_read_col(fp, c), errors="coerce")
                     if col.notna().sum() == 0:
                         continue
@@ -281,7 +307,7 @@ def adopt_existing_outputs(leaves: list[Path], src: Path) -> None:
           f"será REFEITO apenas o último com saída: {ultimo}", flush=True)
 
 
-def run(adopt: bool = False) -> None:
+def run(adopt: bool = False, fine_resume: bool = False) -> None:
     src = CFG.raw_root / CFG.resolution
     if not src.exists():
         raise FileNotFoundError(f"Fonte não encontrada: {src}")
@@ -295,7 +321,9 @@ def run(adopt: bool = False) -> None:
         # de treino), refazendo só o último grupo da ordem.
         adopt_existing_outputs(leaves, src)
 
+    t0_script = time.time()
     n_ok = n_skip = 0
+    tot_rows_read = tot_rows_written = 0
     for i, leaf in enumerate(leaves, 1):
         group_rel = leaf.relative_to(src)          # ex.: Buildings-900K/.../state=AL
         marker = _marker_path(group_rel)
@@ -307,18 +335,55 @@ def run(adopt: bool = False) -> None:
             print(f"[step1] ({i}/{len(leaves)}) {group_rel}: "
                   f"pulado (já concluído)", flush=True)
             continue
-        _clear_partial_outputs(group_rel)
+        if not fine_resume:
+            _clear_partial_outputs(group_rel)   # padrão: refaz o grupo inteiro
+        t_g0 = time.time()
 
         # Acumula as PARTES de cada prédio vindas de TODOS os arquivos do
         # diretório-folha (partições por ano/part-files) antes do corte.
         parts = defaultdict(list)
-        for fp in sorted(f for f in leaf.iterdir() if f.is_file()):
-            if fp.suffix.lower() not in (".parquet", ".csv"):
-                continue
+        data_files = sorted(f for f in leaf.iterdir() if f.is_file()
+                            and f.suffix.lower() in (".parquet", ".csv"))
+        # FASE A — leitura: barra por arquivo do grupo, com nº de prédios
+        # já descobertos no postfix. Cronometrada + contagem de linhas lidas.
+        t0_read, rows_read = time.time(), 0
+        fbar = tqdm(data_files, desc=f"({i}/{len(leaves)}) ler {group_rel}",
+                    unit="arquivo", file=sys.stdout, dynamic_ncols=True)
+        for fp in fbar:
             for bname, bdf in iter_building_series_file(fp):
                 parts[bname].append(bdf)
+                rows_read += len(bdf)
+            if hasattr(fbar, "set_postfix"):
+                fbar.set_postfix(prédios=len(parts), linhas=f"{rows_read:,}")
+        t_read = time.time() - t0_read
 
-        for bname, chunks in parts.items():
+        # FASE B — split + gravação: barra por prédio (é aqui que grupos
+        # grandes passam a maior parte do tempo: milhares de parquets
+        # pequenos escritos em disco/NAS).
+        t0_write, rows_written = time.time(), 0
+        # LINHA CRUCIAL (--fine-resume): a ordem de escrita dos prédios é
+        # DETERMINÍSTICA (arquivos ordenados + extração em ordem de
+        # aparição), então, dos prédios com saída já existente, todos estão
+        # completos EXCETO o último — que é reescrito por segurança.
+        skip_done: set = set()
+        if fine_resume:
+            existing = [b for b in parts
+                        if (CFG.split_root / "train" / group_rel /
+                            f"{b}.parquet").exists()]
+            skip_done = set(existing[:-1])       # último existente é refeito
+            if existing:
+                print(f"[step1][fine-resume] {group_rel}: "
+                      f"{len(skip_done)} prédios já escritos serão pulados; "
+                      f"reescrevendo a partir de '{existing[-1]}'", flush=True)
+
+        t_w0 = time.time()
+        rows_written = 0
+        bbar = tqdm(parts.items(), total=len(parts),
+                    desc=f"({i}/{len(leaves)}) gravar {group_rel}",
+                    unit="prédio", file=sys.stdout, dynamic_ncols=True)
+        for bname, chunks in bbar:
+            if bname in skip_done:
+                continue
             serie = _clean(pd.concat(chunks, ignore_index=True))
             if len(serie) < CFG.min_series_len:
                 n_skip += 1
@@ -335,16 +400,30 @@ def run(adopt: bool = False) -> None:
                 dst = CFG.split_root / split / group_rel / f"{bname}.parquet"
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 part.to_parquet(dst, index=False)
+                rows_written += len(part)
             n_ok += 1
         # LINHA CRUCIAL: o marcador só é gravado APÓS todos os parquets do
         # grupo estarem em disco — um kill no meio deixa o grupo sem
         # marcador e ele será refeito integralmente na próxima execução.
+        t_write = time.time() - t0_write
         marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(json.dumps({"buildings": len(parts)}))
+        marker.write_text(json.dumps({
+            "buildings": len(parts), "rows_read": rows_read,
+            "rows_written": rows_written,
+            "t_read_s": round(t_read, 1), "t_write_s": round(t_write, 1)}))
+        tot_rows_read += rows_read
+        tot_rows_written += rows_written
+        # Resumo do grupo: total | leitura (linhas) | escrita (linhas)
         print(f"[step1] ({i}/{len(leaves)}) {group_rel}: "
-              f"{len(parts)} prédios extraídos", flush=True)
+              f"{len(parts)} prédios | total {_fmt_dur(t_read + t_write)} | "
+              f"leitura {_fmt_dur(t_read)} ({rows_read:,} linhas) | "
+              f"escrita {_fmt_dur(t_write)} ({rows_written:,} linhas)",
+              flush=True)
     print(f"[step1] prédios processados: {n_ok} | descartados (curtos): {n_skip}",
           flush=True)
+    print(f"[step1] TEMPO TOTAL: {_fmt_dur(time.time() - t0_script)} | "
+          f"linhas lidas: {tot_rows_read:,} | "
+          f"linhas escritas: {tot_rows_written:,}", flush=True)
     print(f"[step1] saída em: {CFG.split_root}", flush=True)
 
 
@@ -355,4 +434,10 @@ if __name__ == "__main__":
                     help="adota como concluídos os grupos que já têm saída em "
                          "01_splits (de execuções anteriores ao manifesto), "
                          "refazendo apenas o último grupo da ordem")
-    run(adopt=ap.parse_args().adopt)
+    ap.add_argument("--fine-resume", action="store_true",
+                    help="dentro de um grupo interrompido, PULA os prédios já "
+                         "escritos (reescrevendo só o último) em vez de refazer "
+                         "o grupo inteiro; a leitura dos arquivos-fonte é "
+                         "refeita de qualquer forma")
+    args = ap.parse_args()
+    run(adopt=args.adopt, fine_resume=args.fine_resume)
