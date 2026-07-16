@@ -165,6 +165,31 @@ def _clear_partial_outputs(group_rel: Path) -> None:
 # arquivo inteiro em RAM (causa provável do OOM/'Killed' após state=WY,
 # quando a ordem alfabética chega a SDG/SynD).
 # ---------------------------------------------------------------------------
+def _read_col(fp: Path, col: str) -> pd.Series:
+    """Lê UMA coluna do parquet, tolerante ao caso em que ela foi gravada
+    como ÍNDICE do DataFrame original: o schema do pyarrow a lista como
+    coluna, mas pd.read_parquet(columns=[col]) a devolve no index —
+    df[col] então estoura com KeyError (o bug do 'Timestamp')."""
+    df = pd.read_parquet(fp, columns=[col])
+    if col in df.columns:
+        return df[col].reset_index(drop=True)
+    if df.index.name == col:                 # veio como índice simples
+        return df.index.to_series().reset_index(drop=True)
+    df = df.reset_index()                    # veio em MultiIndex/outros casos
+    if col in df.columns:
+        return df[col].reset_index(drop=True)
+    raise KeyError(f"coluna {col!r} não encontrada em {fp}")
+
+
+def _read_cols(fp: Path, cols: list[str]) -> pd.DataFrame:
+    """Lê múltiplas colunas com a mesma tolerância a coluna-índice."""
+    df = pd.read_parquet(fp, columns=cols)
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        df = df.reset_index()
+    return df[[c for c in cols if c in df.columns]].reset_index(drop=True)
+
+
 def iter_building_series_file(fp: Path):
     """Como iter_building_series, mas decidindo o layout pelo SCHEMA quando
     possível (parquet), para nunca materializar um wide gigante inteiro."""
@@ -175,18 +200,18 @@ def iter_building_series_file(fp: Path):
         except Exception:
             cols = None
         if cols:
+            # Colunas-fantasma de índice do pandas não são prédios:
+            cols = [c for c in cols if not c.startswith("__index_level_")]
             tcol = _find_col(cols, TIME_CANDIDATES)
             non_time = [c for c in cols if c != tcol]
             idcol = _find_col(non_time, ID_CANDIDATES)
             vcol = _find_col(non_time, VALUE_CANDIDATES)
             if idcol is None and vcol is None:
                 # WIDE: uma coluna por prédio — lê [tempo, coluna] por vez.
-                ts = (pd.to_datetime(
-                        pd.read_parquet(fp, columns=[tcol])[tcol],
-                        errors="coerce") if tcol else None)
+                ts = (pd.to_datetime(_read_col(fp, tcol), errors="coerce")
+                      if tcol else None)
                 for c in non_time:
-                    col = pd.read_parquet(fp, columns=[c])[c]
-                    col = pd.to_numeric(col, errors="coerce")
+                    col = pd.to_numeric(_read_col(fp, c), errors="coerce")
                     if col.notna().sum() == 0:
                         continue
                     out = pd.DataFrame({"energy": col})
@@ -197,13 +222,11 @@ def iter_building_series_file(fp: Path):
             if idcol is None and vcol is not None:
                 # SINGLE: lê só as colunas necessárias.
                 use = [vcol] + ([tcol] if tcol else [])
-                df = pd.read_parquet(fp, columns=use)
-                yield from iter_building_series(df, fp.stem)
+                yield from iter_building_series(_read_cols(fp, use), fp.stem)
                 return
             # LONG: precisa de id+valor(+tempo) — lê apenas essas colunas.
             use = [idcol, vcol] + ([tcol] if tcol else [])
-            df = pd.read_parquet(fp, columns=use)
-            yield from iter_building_series(df, fp.stem)
+            yield from iter_building_series(_read_cols(fp, use), fp.stem)
             return
     df = _read_any(fp)
     if df is not None and not df.empty:
