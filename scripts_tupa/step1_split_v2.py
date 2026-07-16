@@ -211,6 +211,28 @@ def _read_cols(fp: Path, cols: list[str]) -> pd.DataFrame:
     return df[[c for c in cols if c in df.columns]].reset_index(drop=True)
 
 
+def _parquet_layout(fp: Path):
+    """Classifica o layout de um parquet pelo SCHEMA (barato):
+    retorna ('wide'|'long'|'single'|None, tcol, non_time)."""
+    if fp.suffix.lower() != ".parquet":
+        return None, None, None
+    try:
+        import pyarrow.parquet as pq
+        cols = [c for c in pq.ParquetFile(fp).schema_arrow.names
+                if not c.startswith("__index_level_")]
+    except Exception:
+        return None, None, None
+    tcol = _find_col(cols, TIME_CANDIDATES)
+    non_time = [c for c in cols if c != tcol]
+    idcol = _find_col(non_time, ID_CANDIDATES)
+    vcol = _find_col(non_time, VALUE_CANDIDATES)
+    if idcol is None and vcol is None:
+        return "wide", tcol, non_time
+    if idcol is None:
+        return "single", tcol, non_time
+    return "long", tcol, non_time
+
+
 def _iter_wide_columns(fp: Path, tcol, cols: list[str]):
     """Itera as colunas de um arquivo WIDE lendo em LOTES limitados por
     CFG.read_ram_budget_gb — em vez de 1 leitura por coluna (que reabre o
@@ -339,6 +361,40 @@ def adopt_existing_outputs(leaves: list[Path], src: Path) -> None:
           f"será REFEITO apenas o último com saída: {ultimo}", flush=True)
 
 
+def _atomic_to_parquet(df: pd.DataFrame, dst: Path) -> None:
+    """Escrita ATÔMICA: grava em .tmp e renomeia — um parquet que EXISTE
+    está sempre íntegro, então retomadas podem pular existentes com
+    segurança (sem heurística de 'reescrever o último')."""
+    tmp = dst.with_name(dst.name + ".tmp")
+    df.to_parquet(tmp, index=False)
+    tmp.replace(dst)
+
+
+def _write_building(group_rel: Path, bname: str, serie: pd.DataFrame,
+                    fine_resume: bool):
+    """Split temporal + gravação de um prédio. Retorna (linhas_escritas,
+    status) com status em {'ok', 'curto', 'pulado'}."""
+    if fine_resume and (CFG.split_root / "train" / group_rel /
+                        f"{bname}.parquet").exists():
+        return 0, "pulado"
+    if len(serie) < CFG.min_series_len:
+        return 0, "curto"
+    if CFG.split_mode == "temporal":
+        split_parts = _temporal_split(serie)
+    else:
+        split_parts = {_building_split_bucket(f"{group_rel}:{bname}"): serie}
+    W = CFG.backcast_length + CFG.forecast_length
+    rows = 0
+    for split, part in split_parts.items():
+        if len(part) < W:
+            continue
+        dst = CFG.split_root / split / group_rel / f"{bname}.parquet"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_to_parquet(part, dst)
+        rows += len(part)
+    return rows, "ok"
+
+
 def run(adopt: bool = False, fine_resume: bool = False) -> None:
     src = CFG.raw_root / CFG.resolution
     if not src.exists():
@@ -371,83 +427,97 @@ def run(adopt: bool = False, fine_resume: bool = False) -> None:
             _clear_partial_outputs(group_rel)   # padrão: refaz o grupo inteiro
         t_g0 = time.time()
 
-        # Acumula as PARTES de cada prédio vindas de TODOS os arquivos do
-        # diretório-folha (partições por ano/part-files) antes do corte.
-        parts = defaultdict(list)
+        # Limpa restos de escrita atômica interrompida:
+        for split in CFG.splits:
+            gdir_out = CFG.split_root / split / group_rel
+            if gdir_out.exists():
+                for tmp in gdir_out.glob("*.tmp"):
+                    tmp.unlink()
+
+        parts = defaultdict(list)         # só p/ layouts long/single
+        n_stream = n_skip_fr = 0
+        rows_written = 0
         data_files = sorted(f for f in leaf.iterdir() if f.is_file()
                             and f.suffix.lower() in (".parquet", ".csv"))
-        # FASE A — leitura: barra por arquivo do grupo, com nº de prédios
-        # já descobertos no postfix. Cronometrada + contagem de linhas lidas.
         t0_read, rows_read = time.time(), 0
-        fbar = tqdm(data_files, desc=f"({i}/{len(leaves)}) ler {group_rel}",
+        fbar = tqdm(data_files, desc=f"({i}/{len(leaves)}) arquivos {group_rel}",
                     unit="arquivo", file=sys.stdout, dynamic_ncols=True)
         for fp in fbar:
-            for bname, bdf in iter_building_series_file(fp):
-                parts[bname].append(bdf)
-                rows_read += len(bdf)
+            layout, _, _ = _parquet_layout(fp)
+            if layout == "wide":
+                # LINHA CRUCIAL (streaming): em arquivos WIDE, cada prédio é
+                # limpo, cortado e GRAVADO assim que sua coluna é extraída, e
+                # liberado da RAM — o pico de memória é o de UM arquivo, não
+                # o do grupo inteiro (causa do Killed em HRSA/01: ~500k
+                # prédios/4,4 bi de linhas acumulados no dicionário).
+                for bname, bdf in iter_building_series_file(fp):
+                    rows_read += len(bdf)
+                    rw, status = _write_building(group_rel, bname,
+                                                 _clean(bdf), fine_resume)
+                    rows_written += rw
+                    if status == "ok":
+                        n_ok += 1; n_stream += 1
+                    elif status == "curto":
+                        n_skip += 1
+                    else:
+                        n_skip_fr += 1
+            else:
+                # LONG/SINGLE: o MESMO prédio pode estar repartido entre
+                # arquivos (partições por ano) — acumula para concatenar.
+                for bname, bdf in iter_building_series_file(fp):
+                    parts[bname].append(bdf)
+                    rows_read += len(bdf)
             if hasattr(fbar, "set_postfix"):
-                fbar.set_postfix(prédios=len(parts), linhas=f"{rows_read:,}")
+                fbar.set_postfix(gravados=n_stream, acumulados=len(parts),
+                                 linhas=f"{rows_read:,}")
         t_read = time.time() - t0_read
+        if n_skip_fr:
+            print(f"[step1][fine-resume] {group_rel}: {n_skip_fr} prédios "
+                  f"já escritos foram pulados (streaming)", flush=True)
 
         # FASE B — split + gravação: barra por prédio (é aqui que grupos
         # grandes passam a maior parte do tempo: milhares de parquets
         # pequenos escritos em disco/NAS).
-        t0_write, rows_written = time.time(), 0
-        # LINHA CRUCIAL (--fine-resume): a ordem de escrita dos prédios é
-        # DETERMINÍSTICA (arquivos ordenados + extração em ordem de
-        # aparição), então, dos prédios com saída já existente, todos estão
-        # completos EXCETO o último — que é reescrito por segurança.
-        skip_done: set = set()
-        if fine_resume:
-            existing = [b for b in parts
-                        if (CFG.split_root / "train" / group_rel /
-                            f"{b}.parquet").exists()]
-            skip_done = set(existing[:-1])       # último existente é refeito
-            if existing:
-                print(f"[step1][fine-resume] {group_rel}: "
-                      f"{len(skip_done)} prédios já escritos serão pulados; "
-                      f"reescrevendo a partir de '{existing[-1]}'", flush=True)
-
+        # FASE B — grava os prédios ACUMULADOS (layouts long/single).
+        # Com escrita atômica, --fine-resume pula TODOS os já existentes
+        # (existe => íntegro), sem heurística de "reescrever o último".
+        t0_write = time.time()
+        n_skip_fr_b = 0
         bbar = tqdm(parts.items(), total=len(parts),
                     desc=f"({i}/{len(leaves)}) gravar {group_rel}",
                     unit="prédio", file=sys.stdout, dynamic_ncols=True)
         for bname, chunks in bbar:
-            if bname in skip_done:
-                continue
             serie = _clean(pd.concat(chunks, ignore_index=True))
-            if len(serie) < CFG.min_series_len:
+            rw, status = _write_building(group_rel, bname, serie, fine_resume)
+            rows_written += rw
+            if status == "ok":
+                n_ok += 1
+            elif status == "curto":
                 n_skip += 1
-                continue
-            if CFG.split_mode == "temporal":
-                split_parts = _temporal_split(serie)
             else:
-                split_parts = {_building_split_bucket(
-                    f"{group_rel}:{bname}"): serie}
-            W = CFG.backcast_length + CFG.forecast_length
-            for split, part in split_parts.items():
-                if len(part) < W:
-                    continue
-                dst = CFG.split_root / split / group_rel / f"{bname}.parquet"
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                part.to_parquet(dst, index=False)
-                rows_written += len(part)
-            n_ok += 1
+                n_skip_fr_b += 1
+        if n_skip_fr_b:
+            print(f"[step1][fine-resume] {group_rel}: {n_skip_fr_b} prédios "
+                  f"acumulados já escritos foram pulados", flush=True)
         # LINHA CRUCIAL: o marcador só é gravado APÓS todos os parquets do
         # grupo estarem em disco — um kill no meio deixa o grupo sem
         # marcador e ele será refeito integralmente na próxima execução.
         t_write = time.time() - t0_write
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(json.dumps({
-            "buildings": len(parts), "rows_read": rows_read,
+            "buildings": n_stream + len(parts), "rows_read": rows_read,
             "rows_written": rows_written,
             "t_read_s": round(t_read, 1), "t_write_s": round(t_write, 1)}))
         tot_rows_read += rows_read
         tot_rows_written += rows_written
         # Resumo do grupo: total | leitura (linhas) | escrita (linhas)
         print(f"[step1] ({i}/{len(leaves)}) {group_rel}: "
-              f"{len(parts)} prédios | total {_fmt_dur(t_read + t_write)} | "
-              f"leitura {_fmt_dur(t_read)} ({rows_read:,} linhas) | "
-              f"escrita {_fmt_dur(t_write)} ({rows_written:,} linhas)",
+              f"{n_stream + len(parts)} prédios | "
+              f"total {_fmt_dur(t_read + t_write)} | "
+              f"arquivos(ler+stream) {_fmt_dur(t_read)} "
+              f"({rows_read:,} linhas lidas) | "
+              f"gravação-acum {_fmt_dur(t_write)} "
+              f"({rows_written:,} linhas escritas no total)",
               flush=True)
     print(f"[step1] prédios processados: {n_ok} | descartados (curtos): {n_skip}",
           flush=True)
