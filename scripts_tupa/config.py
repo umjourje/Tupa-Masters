@@ -11,9 +11,9 @@ from pathlib import Path
 @dataclass
 class PipelineConfig:
     # ---------- Caminhos ----------
-    raw_root: Path = Path(r"C:\Users\paula\source\EnergyBench\Dataset_V0.0\Energy-Load-Profiles")
+    raw_root: Path = Path(r"ROOT/EnergyBench/Dataset_V0.0/Energy-Load-Profiles")
     resolution: str = "Hourly"                    # "15min" | "30min" | "Hourly"
-    out_root: Path = Path(r"D:\Juliana\Dataset-diss\EnergyBench-Anomaly")
+    out_root: Path = Path(r"ROOT/EnergyBench-Anomaly")
 
     # ---------- Passo 1: split ----------
     split_mode: str = "temporal"                  # "temporal" (por edifício, no tempo)
