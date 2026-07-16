@@ -23,7 +23,9 @@ train/test por prédio é a primeira e única operação.
 """
 from __future__ import annotations
 import hashlib
+import json
 import re
+import shutil
 from collections import defaultdict
 from pathlib import Path
 import numpy as np
@@ -142,6 +144,72 @@ def _building_split_bucket(key: str) -> str:
     return "train" if h < CFG.train_frac * 100 else "test"
 
 
+# ---------------------------------------------------------------------------
+# Retomada (resume) — manifesto de grupos concluídos
+# ---------------------------------------------------------------------------
+def _marker_path(group_rel: Path) -> Path:
+    safe = str(group_rel).replace("\\", "__").replace("/", "__")
+    return CFG.split_root / "_manifest_step1" / f"{safe}.done"
+
+
+def _clear_partial_outputs(group_rel: Path) -> None:
+    """Remove QUALQUER saída parcial do grupo antes de reprocessá-lo —
+    garante a semântica 'sobrepõe o que ficou pela metade'."""
+    for split in CFG.splits:
+        shutil.rmtree(CFG.split_root / split / group_rel, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Leitura ECONÔMICA de arquivos wide gigantes (ex.: SDG-1H, SynD-1H):
+# lê o SCHEMA via pyarrow e depois UMA coluna por vez — evita carregar o
+# arquivo inteiro em RAM (causa provável do OOM/'Killed' após state=WY,
+# quando a ordem alfabética chega a SDG/SynD).
+# ---------------------------------------------------------------------------
+def iter_building_series_file(fp: Path):
+    """Como iter_building_series, mas decidindo o layout pelo SCHEMA quando
+    possível (parquet), para nunca materializar um wide gigante inteiro."""
+    if fp.suffix.lower() == ".parquet":
+        try:
+            import pyarrow.parquet as pq
+            cols = list(pq.ParquetFile(fp).schema_arrow.names)
+        except Exception:
+            cols = None
+        if cols:
+            tcol = _find_col(cols, TIME_CANDIDATES)
+            non_time = [c for c in cols if c != tcol]
+            idcol = _find_col(non_time, ID_CANDIDATES)
+            vcol = _find_col(non_time, VALUE_CANDIDATES)
+            if idcol is None and vcol is None:
+                # WIDE: uma coluna por prédio — lê [tempo, coluna] por vez.
+                ts = (pd.to_datetime(
+                        pd.read_parquet(fp, columns=[tcol])[tcol],
+                        errors="coerce") if tcol else None)
+                for c in non_time:
+                    col = pd.read_parquet(fp, columns=[c])[c]
+                    col = pd.to_numeric(col, errors="coerce")
+                    if col.notna().sum() == 0:
+                        continue
+                    out = pd.DataFrame({"energy": col})
+                    if ts is not None:
+                        out["timestamp"] = ts.values
+                    yield _safe_name(c), out
+                return
+            if idcol is None and vcol is not None:
+                # SINGLE: lê só as colunas necessárias.
+                use = [vcol] + ([tcol] if tcol else [])
+                df = pd.read_parquet(fp, columns=use)
+                yield from iter_building_series(df, fp.stem)
+                return
+            # LONG: precisa de id+valor(+tempo) — lê apenas essas colunas.
+            use = [idcol, vcol] + ([tcol] if tcol else [])
+            df = pd.read_parquet(fp, columns=use)
+            yield from iter_building_series(df, fp.stem)
+            return
+    df = _read_any(fp)
+    if df is not None and not df.empty:
+        yield from iter_building_series(df, fp.stem)
+
+
 def _leaf_dirs(src: Path) -> list[Path]:
     """Diretórios-folha de dados: todo diretório que contém DIRETAMENTE
     arquivos parquet/csv. Isso generaliza a descoberta para árvores de
@@ -174,17 +242,24 @@ def run() -> None:
     n_ok = n_skip = 0
     for i, leaf in enumerate(leaves, 1):
         group_rel = leaf.relative_to(src)          # ex.: Buildings-900K/.../state=AL
-        # LINHA CRUCIAL: acumula as PARTES de cada prédio vindas de TODOS os
-        # arquivos DO DIRETÓRIO-FOLHA (partições por ano/part-files) antes de
-        # qualquer corte — preserva a cronologia por prédio.
+        marker = _marker_path(group_rel)
+        # LINHA CRUCIAL (retomada): grupo com marcador .done é PULADO;
+        # grupo sem marcador tem qualquer saída parcial APAGADA e é refeito
+        # do zero — exatamente "retoma de onde parou, sobrepondo o que
+        # ficou pela metade".
+        if marker.exists():
+            print(f"[step1] ({i}/{len(leaves)}) {group_rel}: "
+                  f"pulado (já concluído)", flush=True)
+            continue
+        _clear_partial_outputs(group_rel)
+
+        # Acumula as PARTES de cada prédio vindas de TODOS os arquivos do
+        # diretório-folha (partições por ano/part-files) antes do corte.
         parts = defaultdict(list)
         for fp in sorted(f for f in leaf.iterdir() if f.is_file()):
             if fp.suffix.lower() not in (".parquet", ".csv"):
                 continue
-            df = _read_any(fp)
-            if df is None or df.empty:
-                continue
-            for bname, bdf in iter_building_series(df, fp.stem):
+            for bname, bdf in iter_building_series_file(fp):
                 parts[bname].append(bdf)
 
         for bname, chunks in parts.items():
@@ -205,9 +280,13 @@ def run() -> None:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 part.to_parquet(dst, index=False)
             n_ok += 1
-        if parts:
-            print(f"[step1] ({i}/{len(leaves)}) {group_rel}: "
-                  f"{len(parts)} prédios extraídos", flush=True)
+        # LINHA CRUCIAL: o marcador só é gravado APÓS todos os parquets do
+        # grupo estarem em disco — um kill no meio deixa o grupo sem
+        # marcador e ele será refeito integralmente na próxima execução.
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"buildings": len(parts)}))
+        print(f"[step1] ({i}/{len(leaves)}) {group_rel}: "
+              f"{len(parts)} prédios extraídos", flush=True)
     print(f"[step1] prédios processados: {n_ok} | descartados (curtos): {n_skip}",
           flush=True)
     print(f"[step1] saída em: {CFG.split_root}", flush=True)
