@@ -41,7 +41,12 @@ class PipelineConfig:
                                                   # ou "by_building" (edifícios inteiros por split)
     train_frac: float = 0.85                      # teste = 1 - train (SEM val estático)
     min_series_len: int = 24 * 30                 # descarta séries com < 30 dias
-
+    # Orçamento de RAM (GB) para a LEITURA de arquivos wide no passo 1:
+    # se o arquivo couber, é lido em UMA chamada (pyarrow paraleliza a
+    # descompressão entre núcleos); senão, em lotes de colunas do maior
+    # tamanho que caiba. Com 128 GB de RAM, 64 é um valor seguro.
+    read_ram_budget_gb: float = 64.0
+    
     # ---------- Passo 2: janelamento ----------
     backcast_length: int = 168                    # 7 dias (horário) — igual ao W-LSTMix
     forecast_length: int = 24
