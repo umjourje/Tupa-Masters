@@ -327,10 +327,10 @@ def run(adopt: bool = False, fine_resume: bool = False) -> None:
     for i, leaf in enumerate(leaves, 1):
         group_rel = leaf.relative_to(src)          # ex.: Buildings-900K/.../state=AL
         marker = _marker_path(group_rel)
-        # LINHA CRUCIAL (retomada): grupo com marcador .done é PULADO;
-        # grupo sem marcador tem qualquer saída parcial APAGADA e é refeito
-        # do zero — exatamente "retoma de onde parou, sobrepondo o que
-        # ficou pela metade".
+        # LINHA CRUCIAL (retomada): grupo com marcador .done é PULADO.
+        # Grupo sem marcador: no modo padrão, a saída parcial é APAGADA e o
+        # grupo refeito do zero; com --fine-resume, a saída é mantida e os
+        # prédios já escritos são pulados na Fase B.
         if marker.exists():
             print(f"[step1] ({i}/{len(leaves)}) {group_rel}: "
                   f"pulado (já concluído)", flush=True)
@@ -376,8 +376,6 @@ def run(adopt: bool = False, fine_resume: bool = False) -> None:
                       f"{len(skip_done)} prédios já escritos serão pulados; "
                       f"reescrevendo a partir de '{existing[-1]}'", flush=True)
 
-        t_w0 = time.time()
-        rows_written = 0
         bbar = tqdm(parts.items(), total=len(parts),
                     desc=f"({i}/{len(leaves)}) gravar {group_rel}",
                     unit="prédio", file=sys.stdout, dynamic_ncols=True)
