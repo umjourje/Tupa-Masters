@@ -20,6 +20,7 @@ Visibilidade de execução:
   * Resumo final com janelas totais, tempo e destino dos .pt.
 """
 from __future__ import annotations
+import json
 import sys
 import time
 import numpy as np
@@ -155,9 +156,25 @@ def _flush_shard(buf, buildings, split: str, group_rel: Path,
     return int(out["x"].shape[0])
 
 
+def _marker_path23(split: str, group_rel: Path) -> Path:
+    safe = f"{split}__" + str(group_rel).replace("\\", "__").replace("/", "__")
+    return CFG.windows_root / "_manifest_step23" / f"{safe}.done"
+
+
 def build_group(split: str, gdir: Path, files: list[Path]) -> int:
     group_rel = gdir.relative_to(CFG.split_root / split)
     group_name = group_rel.name if str(group_rel) != "." else "root"
+    marker = _marker_path23(split, group_rel)
+    # LINHA CRUCIAL (retomada): grupo concluído é pulado; grupo interrompido
+    # tem seus shards parciais APAGADOS e é refeito do zero.
+    if marker.exists():
+        log(f"[step2-3] {split}/{group_rel}: pulado (já concluído)")
+        return 0
+    out_dir = CFG.windows_root / split / group_rel.parent
+    for stale in list(out_dir.glob(f"{group_name}.pt")) + \
+                 list(out_dir.glob(f"{group_name}.part*.pt")):
+        stale.unlink()
+        log(f"[step2-3]   shard parcial removido: {stale.name}")
     # 1º passe barato: estima nº de shards p/ decidir o esquema de nomes.
     multi = False
     est = 0
@@ -214,6 +231,10 @@ def build_group(split: str, gdir: Path, files: list[Path]) -> int:
     else:
         log(f"[step2-3] OK {split}/{group_rel}: {total_w} janelas "
             f"em {shards_written} shard(s)")
+    # Marcador só após TODOS os shards do grupo estarem gravados.
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({"windows": total_w,
+                                  "shards": shards_written}))
     return total_w
 
 
