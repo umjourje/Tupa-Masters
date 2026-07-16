@@ -253,7 +253,35 @@ def _leaf_dirs(src: Path) -> list[Path]:
     return leaves
 
 
-def run() -> None:
+def adopt_existing_outputs(leaves: list[Path], src: Path) -> None:
+    """Reconcilia saídas de execuções ANTERIORES ao manifesto: grava o
+    marcador .done para todo grupo que já tem parquets em 01_splits,
+    EXCETO o último deles na ordem de processamento — como a execução é
+    sequencial e ordenada, apenas o último grupo com saída pode ter sido
+    interrompido no meio; ele é refeito (protocolo de reposição do último).
+    """
+    with_output = []
+    for leaf in leaves:
+        rel = leaf.relative_to(src)
+        if _marker_path(rel).exists():
+            continue                              # já reconhecido
+        has_train = any((CFG.split_root / "train" / rel).glob("*.parquet"))
+        if has_train:
+            with_output.append(rel)
+    if not with_output:
+        print("[step1][adopt] nenhum grupo sem marcador com saída existente.",
+              flush=True)
+        return
+    *completos, ultimo = with_output
+    for rel in completos:
+        m = _marker_path(rel)
+        m.parent.mkdir(parents=True, exist_ok=True)
+        m.write_text(json.dumps({"adopted": True}))
+    print(f"[step1][adopt] {len(completos)} grupos adotados como concluídos; "
+          f"será REFEITO apenas o último com saída: {ultimo}", flush=True)
+
+
+def run(adopt: bool = False) -> None:
     src = CFG.raw_root / CFG.resolution
     if not src.exists():
         raise FileNotFoundError(f"Fonte não encontrada: {src}")
@@ -261,6 +289,11 @@ def run() -> None:
     print(f"[step1] {len(leaves)} grupos (diretórios-folha) em {src}", flush=True)
     if not leaves:
         raise RuntimeError(f"Nenhum diretório com parquet/csv sob {src}")
+    if adopt:
+        # LINHA CRUCIAL: reconhece saídas de execuções pré-manifesto sem
+        # reprocessá-las (checagem barata: existência de parquet no split
+        # de treino), refazendo só o último grupo da ordem.
+        adopt_existing_outputs(leaves, src)
 
     n_ok = n_skip = 0
     for i, leaf in enumerate(leaves, 1):
@@ -316,4 +349,10 @@ def run() -> None:
 
 
 if __name__ == "__main__":
-    run()
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--adopt", action="store_true",
+                    help="adota como concluídos os grupos que já têm saída em "
+                         "01_splits (de execuções anteriores ao manifesto), "
+                         "refazendo apenas o último grupo da ordem")
+    run(adopt=ap.parse_args().adopt)
