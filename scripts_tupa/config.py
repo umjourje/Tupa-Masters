@@ -7,13 +7,34 @@ são usados no treino (passos 2-5) e no teste em tempo de execução (passo 8).
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import os
+from dotenv import load_dotenv
+
+# Carrega o .env (procura na raiz do projeto ou no diretório atual)
+load_dotenv()
+
+
+def _get_path_env(var_name: str, default: str) -> Path:
+    """Lê uma variável de ambiente e converte para Path, com fallback."""
+    return Path(os.getenv(var_name, default))
+
 
 @dataclass
 class PipelineConfig:
     # ---------- Caminhos ----------
-    raw_root: Path = Path(r"ROOT/EnergyBench/Dataset_V0.0/Energy-Load-Profiles")
+    raw_root: Path = field(
+        default_factory=lambda: _get_path_env(
+            "RAW_ROOT",
+            r"/EnergyBench/Dataset_V0.0/Energy-Load-Profiles",
+        )
+    )
     resolution: str = "Hourly"                    # "15min" | "30min" | "Hourly"
-    out_root: Path = Path(r"ROOT/EnergyBench-Anomaly")
+    out_root: Path = field(
+        default_factory=lambda: _get_path_env(
+            "OUT_ROOT",
+            r"/EnergyBench-Anomaly",
+        )
+    )
 
     # ---------- Passo 1: split ----------
     split_mode: str = "temporal"                  # "temporal" (por edifício, no tempo)
