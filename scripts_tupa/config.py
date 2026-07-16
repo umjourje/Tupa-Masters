@@ -33,7 +33,7 @@ class PipelineConfig:
         default_factory=lambda: _get_path_env(
             "OUT_ROOT",
             r"/EnergyBench-Anomaly",
-        ) / "EnergyBench-Anomaly"
+        )
     )
 
     # ---------- Passo 1: split ----------
