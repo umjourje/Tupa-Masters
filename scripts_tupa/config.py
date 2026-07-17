@@ -51,11 +51,11 @@ class PipelineConfig:
     # se o arquivo couber, é lido em UMA chamada (pyarrow paraleliza a
     # descompressão entre núcleos); senão, em lotes de colunas do maior
     # tamanho que caiba. Com 128 GB de RAM, 64 é um valor seguro.
-    read_ram_budget_gb: float = 64.0
+    read_ram_budget_gb: float = 256.0 # somente para o passo 1
     # ---------- DuckDB (leituras/escritas massivas nos passos 2-5) ----------
     duckdb_threads: int = 0                       # 0 = automático (todos os núcleos)
-    duckdb_memory_limit_gb: float = 64.0
-    duckdb_files_per_batch: int = 512             # parquets de prédio por query
+    duckdb_memory_limit_gb: float = 400.0
+    duckdb_files_per_batch: int = 2048 # 8192             # files_per_batch ≈ RAM_alvo_do_lote / (linhas_por_arquivo × 500)
 
     # ---------- Passo 2: janelamento ----------
     # ATENÇÃO (resolução): valores em PASSOS. Para "15min", 7 dias = 672,
