@@ -30,7 +30,7 @@ import torch
 from pathlib import Path
 from config import CFG
 from perf_log import RunLogger, _fmt_dur
-from step2_3_windows_wavelet import iter_windows, decompose_window  # p/ passo 8
+from step2_3_windows_wavelet_v2 import iter_windows, decompose_window  # p/ passo 8
 
 try:
     from tqdm import tqdm
