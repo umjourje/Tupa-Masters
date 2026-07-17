@@ -26,6 +26,7 @@ edifício indentados por lote/grupo + snapshots de recursos.
 """
 from __future__ import annotations
 import json
+import os
 import sys
 import time
 import numpy as np
@@ -185,7 +186,7 @@ def _flush_shard(buf, buildings, split, group_rel, group_name,
     return int(out["x"].shape[0])
 
 
-def build_group(split: str, gdir: Path, files: list[Path],
+def build_group(split: str, gdir: Path,
                 logger: RunLogger, fine_resume: bool,
                 idx: int, total_groups: int) -> int:
     group_rel = gdir.relative_to(CFG.split_root / split)
@@ -196,6 +197,13 @@ def build_group(split: str, gdir: Path, files: list[Path],
                     f"pulado (já concluído)")
         return 0
 
+    # Enumeração dos parquets APENAS deste grupo (pode custar minutos num
+    # grupo de milhões de arquivos — é inevitável para processá-lo, mas
+    # agora não acontece para os grupos filtrados fora).
+    t_ls = time.time()
+    files = sorted(f for f in gdir.glob("*.parquet") if f.is_file())
+    logger.file_only(f"    listagem do grupo: {len(files):,} arquivos "
+                     f"em {_fmt_dur(time.time() - t_ls)}")
     out_dir = CFG.windows_root / split / group_rel.parent
     manifest = _shards_manifest(split, group_rel, group_name)
     done_buildings: set = set()
@@ -275,41 +283,69 @@ def build_group(split: str, gdir: Path, files: list[Path],
     return total_w
 
 
-def discover():
+def _find_leaf_dirs(base: Path) -> list[Path]:
+    """Descoberta PREGUIÇOSA de grupos-folha: os.scandir recursivo que, ao
+    encontrar o PRIMEIRO .parquet de um diretório, o marca como folha e
+    PARA de enumerar — num grupo com 2 milhões de arquivos, lê 1 entrada
+    em vez de 2 milhões. (Antes: rglob('*') listava a árvore inteira —
+    ~6,6M de stats no NAS — antes mesmo de aplicar o filtro --group.)
+
+    Premissa: diretórios-folha contêm apenas arquivos (é o layout gerado
+    pelo passo 1)."""
+    leaves = []
+
+    def rec(d: Path):
+        subdirs = []
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    if e.is_file() and e.name.endswith(".parquet"):
+                        leaves.append(d)      # folha: EARLY EXIT
+                        return
+                    if e.is_dir():
+                        subdirs.append(Path(e.path))
+        except OSError:
+            return
+        for s in sorted(subdirs):
+            rec(s)
+
+    rec(base)
+    return sorted(leaves)
+
+
+def discover(group: str | None = None):
+    """Retorna [(split, gdir)] — a lista de ARQUIVOS de cada grupo só é
+    enumerada depois, e somente para os grupos selecionados."""
     plan = []
     for split in CFG.splits:
         base = CFG.split_root / split
         if not base.exists():
             continue
-        for gdir in sorted([base] + [p for p in base.rglob("*") if p.is_dir()]):
-            files = sorted(f for f in gdir.glob("*.parquet") if f.is_file())
-            if files:
-                plan.append((split, gdir, files))
+        for gdir in _find_leaf_dirs(base):
+            rel = str(gdir.relative_to(base)).lower()
+            # LINHA CRUCIAL: o filtro age ANTES de listar qualquer arquivo.
+            if group and group.lower() not in rel:
+                continue
+            plan.append((split, gdir))
     return plan
 
 
 def run(fine_resume: bool = False, group: str | None = None) -> None:
     logger = RunLogger("step2_3")
-    plan = discover()
-    if group:
-        # LINHA CRUCIAL (execução de teste): mantém apenas grupos cujo
-        # caminho relativo contém o filtro — ex.: --group "state=AL",
-        # --group "HRSA/11", --group SynD. Case-insensitive.
-        g = group.lower()
-        plan = [(s, d, f) for (s, d, f) in plan
-                if g in str(d.relative_to(CFG.split_root / s)).lower()]
-        logger.term(f"[step2-3] filtro --group '{group}': "
-                    f"{len(plan)} grupo(s) selecionado(s)")
-    logger.term(f"[step2-3] inventário: {len(plan)} grupos, "
-                f"{sum(len(f) for *_, f in plan)} arquivos, splits={CFG.splits}")
+    t_d = time.time()
+    plan = discover(group)
+    logger.term(f"[step2-3] inventário: {len(plan)} grupo(s) "
+                f"{'(filtro: ' + group + ') ' if group else ''}"
+                f"descobertos em {_fmt_dur(time.time() - t_d)}, "
+                f"splits={CFG.splits}")
     if not plan:
         logger.close("vazio")
-        raise RuntimeError(f"Nada para processar em {CFG.split_root}.")
+        raise RuntimeError(f"Nada para processar em {CFG.split_root} "
+                           f"(filtro={group!r}).")
     t0 = time.time()
     grand = 0
-    for i, (split, gdir, files) in enumerate(plan, 1):
-        grand += build_group(split, gdir, files, logger, fine_resume,
-                             i, len(plan))
+    for i, (split, gdir) in enumerate(plan, 1):
+        grand += build_group(split, gdir, logger, fine_resume, i, len(plan))
     logger.term(f"[step2-3] FIM: {grand} janelas em {_fmt_dur(time.time()-t0)} "
                 f"| saída em {CFG.windows_root}")
     logger.close(f"janelas={grand}")
