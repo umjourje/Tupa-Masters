@@ -80,6 +80,36 @@ def n_windows(series_len: int) -> int:
     return 0 if series_len < W else (series_len - W) // CFG.stride + 1
 
 
+# ====================== parada graciosa (Ctrl+C) ===========================
+import signal
+
+_STOP = {"flag": False, "hits": 0, "con": None}
+_BATCH_HARD_CAP = 65536       # trava de sanidade p/ duckdb_files_per_batch
+
+
+def _on_sigint(signum, frame):
+    _STOP["hits"] += 1
+    if _STOP["hits"] == 1:
+        _STOP["flag"] = True
+        # LINHA CRUCIAL: aborta a query DuckDB EM ANDAMENTO — sem isso, o
+        # Ctrl+C só seria processado quando a query (potencialmente enorme)
+        # terminasse sozinha.
+        con = _STOP.get("con")
+        if con is not None:
+            try:
+                con.interrupt()
+            except Exception:
+                pass
+        print("\n[step2-3] PARADA solicitada: finalizando o prédio atual, "
+              "gravando shard parcial + manifesto (retomável com "
+              "--fine-resume). Ctrl+C de novo = aborto imediato.", flush=True)
+    else:
+        print("\n[step2-3] aborto imediato (memória devolvida ao SO).",
+              flush=True)
+        import os as _os
+        _os._exit(130)
+
+
 # ============================ leitura DuckDB ===============================
 def _duck_con():
     import duckdb
@@ -115,16 +145,30 @@ def iter_group_series(files: list[Path], logger: RunLogger, bar):
             yield fp.stem, s
         return
 
-    B = CFG.duckdb_files_per_batch
+    _STOP["con"] = con
+    B = min(CFG.duckdb_files_per_batch, _BATCH_HARD_CAP)
+    n_batches = (len(files) + B - 1) // B
     for k in range(0, len(files), B):
+        if _STOP["flag"]:
+            return
         batch = files[k:k + B]
+        if hasattr(bar, "set_postfix"):
+            bar.set_postfix(fase=f"lendo lote {k // B + 1}/{n_batches}")
         t0 = time.time()
-        df = duck_read_batch(con, [str(f) for f in batch])
+        try:
+            df = duck_read_batch(con, [str(f) for f in batch])
+        except Exception as e:
+            if _STOP["flag"]:                 # query abortada pelo interrupt
+                logger.term(f"[step2-3] lote {k // B + 1} interrompido.")
+                return
+            raise e
         t_read = time.time() - t0
         logger.file_start(f"lote {k // B + 1} ({len(batch)} arquivos)")
         logger.file_only(f"    leitura duckdb: {_fmt_dur(t_read)} "
                          f"({len(df):,} linhas)")
         for name, g in df.groupby("filename", sort=True):
+            if _STOP["flag"]:
+                return
             s = np.nan_to_num(g.sort_values("rn")["energy"]
                               .to_numpy(np.float64))
             bar.update(1)
@@ -266,10 +310,20 @@ def build_group(split: str, gdir: Path,
             multi = True
             logger.snapshot(f"pós-shard {shard_idx - 1}")
     if buf["x"]:
+        # Vale também para a PARADA graciosa: o shard parcial é gravado com
+        # manifesto — o --fine-resume continua exatamente daqui.
         total_w += _flush_shard(buf, buildings, split, group_rel,
-                                group_name, shard_idx, multi, logger)
+                                group_name, shard_idx,
+                                multi or _STOP["flag"], logger)
         shards_written += 1
     bar.close()
+
+    if _STOP["flag"]:
+        logger.term(f"[step2-3] {split}/{group_rel}: interrompido com "
+                    f"{total_w} janelas em {shards_written} shard(s) "
+                    f"parciais — retome com --fine-resume.")
+        logger.group_end(f"{split}/{group_rel}", "| INTERROMPIDO")
+        return total_w
 
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(json.dumps({"windows": total_w,
@@ -331,7 +385,14 @@ def discover(group: str | None = None):
 
 
 def run(fine_resume: bool = False, group: str | None = None) -> None:
+    signal.signal(signal.SIGINT, _on_sigint)
+    signal.signal(signal.SIGTERM, _on_sigint)
     logger = RunLogger("step2_3")
+    if CFG.duckdb_files_per_batch > _BATCH_HARD_CAP:
+        logger.term(f"[step2-3][AVISO] duckdb_files_per_batch="
+                    f"{CFG.duckdb_files_per_batch} é absurdo (é nº de "
+                    f"ARQUIVOS por query, não linhas/s!); usando o teto "
+                    f"{_BATCH_HARD_CAP}.")
     t_d = time.time()
     plan = discover(group)
     logger.term(f"[step2-3] inventário: {len(plan)} grupo(s) "
@@ -346,6 +407,9 @@ def run(fine_resume: bool = False, group: str | None = None) -> None:
     grand = 0
     for i, (split, gdir) in enumerate(plan, 1):
         grand += build_group(split, gdir, logger, fine_resume, i, len(plan))
+        if _STOP["flag"]:
+            logger.term("[step2-3] execução interrompida pelo usuário.")
+            break
     logger.term(f"[step2-3] FIM: {grand} janelas em {_fmt_dur(time.time()-t0)} "
                 f"| saída em {CFG.windows_root}")
     logger.close(f"janelas={grand}")

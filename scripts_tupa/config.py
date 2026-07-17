@@ -55,7 +55,11 @@ class PipelineConfig:
     # ---------- DuckDB (leituras/escritas massivas nos passos 2-5) ----------
     duckdb_threads: int = 0                       # 0 = automático (todos os núcleos)
     duckdb_memory_limit_gb: float = 400.0
-    duckdb_files_per_batch: int = 2048 # 8192             # files_per_batch ≈ RAM_alvo_do_lote / (linhas_por_arquivo × 500)
+
+    # Conta para esse valor:
+    # bytes_por_linha ≈ (8 + 8 + 220) × 2 ≈ ~470 B   (arredonde para 500)
+    # RAM_do_lote ≈ files_per_batch × linhas_por_arquivo × 500 B
+    duckdb_files_per_batch: int = 8192             # files_per_batch ≈ 32e9 / (8760 × 500) ≈ 7.300  → use 8192 (2048*4)
 
     # ---------- Passo 2: janelamento ----------
     # ATENÇÃO (resolução): valores em PASSOS. Para "15min", 7 dias = 672,
