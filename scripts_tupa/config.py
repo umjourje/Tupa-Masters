@@ -3,38 +3,44 @@ Configuração central do pipeline de detecção de anomalias.
 Todos os passos (1 a 8) leem deste arquivo para garantir consistência
 — em especial, os MESMOS parâmetros de janelamento, wavelet e rotulagem
 são usados no treino (passos 2-5) e no teste em tempo de execução (passo 8).
+
+Caminhos críticos vêm de variáveis de ambiente (arquivo .env na raiz do
+projeto ou exportadas no shell), para não expor pastas de sistema no código:
+
+    RAW_ROOT=/caminho/completo/ate/.../Energy-Load-Profiles
+    OUT_ROOT=/caminho/completo/ate/a/pasta/de/saida
+
+RAW_ROOT deve apontar DIRETAMENTE para a pasta que contém as resoluções
+(15min/30min/Hourly) — ex.: .../Energy-Load-Profiles ou
+.../Synthetic-Energy-Load-Profiles. Nada é concatenado depois.
 """
 from dataclasses import dataclass, field
 from pathlib import Path
-
 import os
-from dotenv import load_dotenv
 
-# Carrega o .env (procura na raiz do projeto ou no diretório atual)
-load_dotenv()
+try:                                    # dotenv é opcional: sem o pacote,
+    from dotenv import load_dotenv      # vale o que estiver exportado no shell
+    load_dotenv()
+except ImportError:
+    pass
 
 
-def _get_path_env(var_name: str, default: str) -> Path:
-    """Lê uma variável de ambiente e converte para Path, com fallback."""
-    return Path(os.getenv(var_name, default))
+def _get_path_env(var_name: str) -> Path:
+    """Lê uma variável de ambiente obrigatória e converte para Path."""
+    val = os.getenv(var_name)
+    if not val:
+        raise RuntimeError(
+            f"Variável de ambiente {var_name} não definida. "
+            f"Defina-a no .env ou exporte no shell (caminho completo).")
+    return Path(val)
 
 
 @dataclass
 class PipelineConfig:
-    # ---------- Caminhos ----------
-    raw_root: Path = field(
-        default_factory=lambda: _get_path_env(
-            "RAW_ROOT",
-            r"/EnergyBench/Dataset_V0.0/Energy-Load-Profiles",
-        ) / "EnergyBench" / "Dataset_V0.0" / "Energy-Load-Profiles"
-    )
+    # ---------- Caminhos (obrigatórios, via .env) ----------
+    raw_root: Path = field(default_factory=lambda: _get_path_env("RAW_ROOT"))
+    out_root: Path = field(default_factory=lambda: _get_path_env("OUT_ROOT"))
     resolution: str = "Hourly"                    # "15min" | "30min" | "Hourly"
-    out_root: Path = field(
-        default_factory=lambda: _get_path_env(
-            "OUT_ROOT",
-            r"/EnergyBench-Anomaly",
-        )
-    )
 
     # ---------- Passo 1: split ----------
     split_mode: str = "temporal"                  # "temporal" (por edifício, no tempo)
@@ -46,8 +52,14 @@ class PipelineConfig:
     # descompressão entre núcleos); senão, em lotes de colunas do maior
     # tamanho que caiba. Com 128 GB de RAM, 64 é um valor seguro.
     read_ram_budget_gb: float = 64.0
-    
+    # ---------- DuckDB (leituras/escritas massivas nos passos 2-5) ----------
+    duckdb_threads: int = 0                       # 0 = automático (todos os núcleos)
+    duckdb_memory_limit_gb: float = 64.0
+    duckdb_files_per_batch: int = 512             # parquets de prédio por query
+
     # ---------- Passo 2: janelamento ----------
+    # ATENÇÃO (resolução): valores em PASSOS. Para "15min", 7 dias = 672,
+    # forecast/stride/period/val_horizon = 96. Ajuste ao trocar resolution.
     backcast_length: int = 168                    # 7 dias (horário) — igual ao W-LSTMix
     forecast_length: int = 24
     stride: int = 24                              # sobreposição: janelas deslizam 1 dia
@@ -56,6 +68,10 @@ class PipelineConfig:
     # ---------- Passo 3: wavelet ----------
     wavelet: str = "db4"
     wavelet_level: int = 5                        # será truncado por dwt_max_level se preciso
+    # Sharding do passo 2-3 (proteção de RAM p/ grupos gigantes, ex.
+    # Buildings-900K): descarrega um .pt a cada N janelas acumuladas,
+    # sempre em fronteira de prédio. ~3,9 KB/janela -> 200k ~ 0,8 GB.
+    max_windows_per_shard: int = 200_000
 
     # ---------- Passos 4-5: rótulos ----------
     # Limiar BICAUDAL: anômalo se resíduo < q_low OU resíduo > q_high
