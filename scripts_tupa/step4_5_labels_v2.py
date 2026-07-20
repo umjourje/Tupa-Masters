@@ -48,9 +48,17 @@ except ImportError:
 # ==================== rotulagem/fusão (INALTERADAS) ========================
 def label_window(window: np.ndarray, trend: np.ndarray) -> np.ndarray:
     """Bicaudal: anômalo se resíduo < q_low OU > q_high (intra-janela)."""
-    resid = window - trend
-    thr_low = np.quantile(resid, CFG.anomaly_quantile_low)
-    thr_high = np.quantile(resid, CFG.anomaly_quantile_high)
+    return label_windows_batch(window[None, :], trend[None, :])[0]
+
+
+def label_windows_batch(x: np.ndarray, trend: np.ndarray) -> np.ndarray:
+    """LINHA CRUCIAL (vetorização): quantis por janela calculados de uma
+    vez para TODAS as janelas (axis=1) — o loop Python por janela some."""
+    resid = x - trend
+    thr_low = np.quantile(resid, CFG.anomaly_quantile_low,
+                          axis=1, keepdims=True)
+    thr_high = np.quantile(resid, CFG.anomaly_quantile_high,
+                           axis=1, keepdims=True)
     return ((resid < thr_low) | (resid > thr_high)).astype(np.uint8)
 
 
@@ -119,9 +127,7 @@ def label_pack(split: str, pt: Path, logger: RunLogger,
 
     # PASSO 4 — rótulo por janela
     t_p4 = time.time()
-    win_labels = np.empty((N, Wl), dtype=np.uint8)
-    for i in range(N):
-        win_labels[i] = label_window(x[i], trend[i])
+    win_labels = label_windows_batch(x, trend)       # vetorizado (1 chamada)
     pack["labels"] = torch.tensor(win_labels)
     logger.file_only(f"    passo 4 (rótulos por janela): "
                      f"{N} janelas em {_fmt_dur(time.time() - t_p4)}")
@@ -129,7 +135,7 @@ def label_pack(split: str, pt: Path, logger: RunLogger,
     # PASSO 5 — fusão + reconstrução da série + tabela consolidada
     t_p5 = time.time()
     fused_per_window = np.zeros_like(win_labels)
-    frames = []
+    frames, block_lines = [], []
     bbar = tqdm(list(enumerate(pack["buildings"])),
                 desc=f"({idx}/{total}) fundir {pt.stem}", unit="prédio",
                 file=sys.stdout, dynamic_ncols=True)
@@ -156,9 +162,12 @@ def label_pack(split: str, pt: Path, logger: RunLogger,
             "energy": np.nan_to_num(energy),
             "anomaly": fused,
         }))
-        logger.building(name, f"len={series_len:,} "
-                        f"taxa={fused.mean():.4f} t={time.time() - t_b:.3f}s")
+        block_lines.append(f"      {name}: len={series_len:,} "
+                           f"taxa={fused.mean():.4f} "
+                           f"t={time.time() - t_b:.3f}s")
     bbar.close()
+    # LOG EM BLOCO: todas as linhas por-prédio deste .pt de uma vez.
+    logger.file_only("\n".join(block_lines))
 
     table = pd.concat(frames, ignore_index=True)
     del frames
