@@ -1,0 +1,30 @@
+[project]
+name = "wlstmix-fed-anomaly"
+version = "0.1.0"
+dependencies = ["flwr>=1.21", "torch", "numpy", "pandas", "scikit-learn",
+                "pywavelets", "tensorboard", "python-dotenv", "duckdb"]
+
+[tool.flwr.app]
+publisher = "tupa"
+
+[tool.flwr.app.components]
+serverapp = "server_app:app"
+clientapp = "client_app:app"
+
+[tool.flwr.app.config]
+num-server-rounds = 10
+local-epochs = 1
+lr = 0.001
+v0-path = "/caminho/para/04_models/rolling/best_model.pth"
+
+[tool.flwr.federations]
+default = "local-sim"
+
+# Ensaio local (4 supernós simulados) antes dos Raspberries:
+[tool.flwr.federations.local-sim]
+options.num-supernodes = 4
+
+# Implantação real com TLS (ajuste o endereço do SuperLink):
+[tool.flwr.federations.raspberry-deployment]
+address = "servidor:9093"
+root-certificates = "certificates/ca.crt"

@@ -1,77 +1,50 @@
-"""client_app.py — ClientApp Flower (Message API) para o W-LSTMix federado.
+"""client_app.py — ClientApp (Message API): treino/avaliação locais do
+HybridWLSTMix sobre os artefatos do pipeline no disco do dispositivo.
 
-Substitui o antigo client.py (NumPyClient + fl.client.start_client).
-Roda dentro de um SuperNode em cada Raspberry Pi:
+Cada SuperNode declara sua partição:
+    flower-supernode ... --node-config "data-root='/dados/particao_X'"
 
-    flower-supernode \
-        --root-certificates certificates/ca.crt \
-        --superlink IP_DO_SERVIDOR:9092 \
-        --node-config "partition-id=0 num-partitions=5 data-root='/home/pi/data'"
-
-Toda a lógica de modelo/dados/treino/avaliação vive em task.py.
+local-epochs e lr vêm do run_config do app (pyproject/flwr run), o mesmo
+valor que o servidor usa para o eixo de épocas do TensorBoard.
 """
-
-from __future__ import annotations
-
-import logging
+from pathlib import Path
 
 import torch
 from flwr.app import ArrayRecord, Context, Message, MetricRecord, RecordDict
 from flwr.clientapp import ClientApp
 
-from meuapp import task  # ajuste 'meuapp' ao nome do seu pacote
-
-log = logging.getLogger("wlstmix.client")
+import task
 
 app = ClientApp()
 
 
-def _setup(context: Context):
-    """Configuração comum a train e evaluate."""
-    cfg = task.load_config()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    partition_id = int(context.node_config["partition-id"])
-    data_root = str(context.node_config.get("data-root", "./data"))
-    return cfg, device, partition_id, data_root
+def _device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 @app.train()
 def train(msg: Message, context: Context) -> Message:
-    cfg, device, partition_id, data_root = _setup(context)
-    local_epochs = int(context.run_config.get("local-epochs", 1))
-
-    # Reconstrói o modelo e carrega os pesos GLOBAIS recebidos do servidor
-    model = task.get_model(cfg, device)
+    device = _device()
+    model = task.get_model(task.load_config(), device)
+    # pesos globais da rodada -> modelo local
     model.load_state_dict(msg.content["arrays"].to_torch_state_dict())
-
-    # Dados locais deste dispositivo (a partição É o disco local)
-    train_ds = task.load_split(data_root, "train", cfg)
-    val_ds = task.load_split(data_root, "val", cfg)  # pode ser None
-    if train_ds is None:
-        raise FileNotFoundError(f"Sem dados de treino em {data_root}/train")
-
-    log.info("Cliente %d: iniciando %d época(s) local(is)", partition_id, local_epochs)
-    metrics = task.train(model, train_ds, cfg, device, local_epochs, val_ds)
-    metrics["partition_id"] = partition_id  # rotula as métricas no servidor
-
-    reply = RecordDict(
-        {
-            "arrays": ArrayRecord(model.state_dict()),
-            "metrics": MetricRecord(metrics),
-        }
-    )
+    data_root = Path(context.node_config["data-root"])
+    metrics = task.train(
+        model, data_root, device,
+        epochs=int(context.run_config.get("local-epochs", 1)),
+        lr=float(context.run_config.get("lr", 1e-3)))
+    reply = RecordDict({"arrays": ArrayRecord(model.state_dict()),
+                        "metrics": MetricRecord(metrics)})
     return Message(content=reply, reply_to=msg)
 
 
 @app.evaluate()
 def evaluate(msg: Message, context: Context) -> Message:
-    cfg, device, partition_id, data_root = _setup(context)
-
-    model = task.get_model(cfg, device)
+    device = _device()
+    model = task.get_model(task.load_config(), device)
     model.load_state_dict(msg.content["arrays"].to_torch_state_dict())
-
-    metrics = task.evaluate(model, cfg, device, data_root)
-    metrics["partition_id"] = partition_id
-
-    reply = RecordDict({"metrics": MetricRecord(metrics)})
-    return Message(content=reply, reply_to=msg)
+    model.eval()
+    data_root = Path(context.node_config["data-root"])
+    metrics = task.evaluate(model, data_root, device)
+    return Message(content=RecordDict({"metrics": MetricRecord(metrics)}),
+                   reply_to=msg)

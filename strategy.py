@@ -153,10 +153,13 @@ class TensorBoardFedAvg(FedAvg):
                 )
                 if improved:
                     self._best = current
+                    # Escrita ATÔMICA (padrão do pipeline): .tmp + rename —
+                    # um kill no meio nunca corrompe o melhor checkpoint.
+                    tmp = str(self.checkpoint_path) + ".tmp"
                     torch.save(
-                        self._latest_arrays.to_torch_state_dict(),
-                        self.checkpoint_path,
-                    )
+                        self._latest_arrays.to_torch_state_dict(), tmp)
+                    import os as _os
+                    _os.replace(tmp, self.checkpoint_path)
                     log.info(
                         "Rodada %d: novo melhor %s=%.6f — checkpoint salvo em %s",
                         server_round, self.selection_metric, current,
